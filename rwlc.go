@@ -2,7 +2,6 @@ package rwlc
 
 import (
 	"errors"
-	"sync"
 )
 
 var ErrClosed = errors.New("closed")
@@ -14,75 +13,60 @@ type ReadWriteLineCloser interface {
 }
 
 type rwlc struct {
-	mu     sync.Mutex
-	head   chan string
-	tail   []string
-	done   chan struct{}
-	closed bool
+	lines chan []string
+	empty chan struct{}
+
+	closed chan struct{}
 }
 
 func New() ReadWriteLineCloser {
+	lines := make(chan []string, 1)
+
+	empty := make(chan struct{}, 1)
+	empty <- struct{}{}
+
 	return &rwlc{
-		head: make(chan string, 1),
-		done: make(chan struct{}),
+		lines: lines,
+		empty: empty,
+
+		closed: make(chan struct{}),
 	}
 }
 
 func (rw *rwlc) ReadLine() (s string, err error) {
-	rw.mu.Lock()
-	closed := rw.closed
-	rw.mu.Unlock()
-	if closed {
-		return s, ErrClosed
-	}
-
+	var lines []string
 	select {
-	case s = <-rw.head:
-	case <-rw.done:
-		return s, ErrClosed
+	case <-rw.closed:
+		return "", ErrClosed
+	case lines = <-rw.lines:
 	}
 
-	rw.mu.Lock()
-	if len(rw.tail) > 0 {
-		rw.tryPushLocked()
+	s = lines[0]
+	if len(lines) > 1 {
+		rw.lines <- lines[1:]
+	} else {
+		rw.empty <- struct{}{}
 	}
-	rw.mu.Unlock()
 
 	return s, nil
 }
 
 func (rw *rwlc) WriteLine(s string) error {
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
+	var lines []string
 
-	if rw.closed {
+	select {
+	case <-rw.closed:
 		return ErrClosed
+	case lines = <-rw.lines:
+	case <-rw.empty:
 	}
 
-	rw.tail = append(rw.tail, s)
-
-	rw.tryPushLocked()
+	lines = append(lines, s)
+	rw.lines <- lines
 
 	return nil
 }
 
-// tries to push the head-of-tail to the head
-func (rw *rwlc) tryPushLocked() {
-	select {
-	case rw.head <- rw.tail[0]:
-		rw.tail = rw.tail[1:]
-	default:
-	}
-}
-
 func (rw *rwlc) Close() {
-	rw.mu.Lock()
-	if rw.closed {
-		rw.mu.Unlock()
-		return
-	}
-	rw.closed = true
-	rw.mu.Unlock()
-
-	close(rw.done)
+	close(rw.closed)
 }
